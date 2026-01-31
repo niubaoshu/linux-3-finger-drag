@@ -1,6 +1,5 @@
 use serde::Deserialize;
 use serde_json::from_str;
-use serde_with::serde_as;
 use std::{
     fs::{File, read_to_string, OpenOptions}, 
     io::ErrorKind, 
@@ -24,9 +23,9 @@ pub enum LogLevel { OFF, ERROR, WARN, INFO, DEBUG, TRACE }
 
 // we had to have a wrapper for simplelog::LevelFilter for deserializing, 
 // now we gotta make that wrapper useful in the program
-impl Into<LevelFilter> for LogLevel {
-    fn into(self) -> LevelFilter {
-        match self {
+impl From<LogLevel> for LevelFilter {
+    fn from(val: LogLevel) -> Self {
+        match val {
             LogLevel::OFF   => LevelFilter::OFF,
             LogLevel::ERROR => LevelFilter::ERROR,
             LogLevel::WARN  => LevelFilter::WARN,

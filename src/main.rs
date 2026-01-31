@@ -1,9 +1,14 @@
 use std::{
     sync::{
         Arc, atomic::{AtomicBool, Ordering}
-    }, time::SystemTime
+    }, 
+    time::Duration,
+    os::unix::io::AsRawFd
 };
-use tokio::sync::mpsc::{self, Receiver};
+use tokio::{
+    sync::mpsc::{self, Receiver},
+    io::unix::AsyncFd
+};
 use signal_hook::{self, consts::{SIGINT, SIGTERM}, flag};
 use tracing::{debug, error, info, trace};
 use tracing_subscriber::fmt::time::ChronoLocal;
@@ -19,9 +24,6 @@ use linux_3_finger_drag::{
 
 #[tokio::main]
 async fn main() -> Result<(), GtError> {
-
-    let cfg_file = config::get_config_file_path()?; 
-    let cfg_last_modified = std::fs::metadata(cfg_file)?.modified()?;
 
     let configs = config::init_cfg();
 
@@ -39,11 +41,13 @@ async fn main() -> Result<(), GtError> {
 
     // handling SIGINT and SIGTERM
     let should_exit = Arc::new(AtomicBool::new(false));
-    flag::register(SIGTERM, Arc::clone(&should_exit)).unwrap();
-    flag::register(SIGINT,  Arc::clone(&should_exit)).unwrap();
+    flag::register(SIGTERM, Arc::clone(&should_exit))
+        .expect("Failed to register SIGTERM handler");
+    flag::register(SIGINT,  Arc::clone(&should_exit))
+        .expect("Failed to register SIGINT handler");
 
     let (sender, recvr) = mpsc::channel::<ControlSignal>(3);
-    let mut vtrackpad = virtual_trackpad::start_handler()?;
+    let vtrackpad = virtual_trackpad::start_handler()?;
 
     info!("Searching for the trackpad on your device...");
 
@@ -55,16 +59,15 @@ async fn main() -> Result<(), GtError> {
         Ok(real_trackpad) => {
 
             let translator = GestureTranslator::new(
-                vtrackpad.clone(), 
-                configs.clone(),
+                vtrackpad, 
+                configs,
                 sender
             );
             run_main_event_loop(
                 translator, 
                 recvr, 
                 &should_exit, 
-                real_trackpad, 
-                cfg_last_modified
+                real_trackpad
             ).await
         },
         Err(e) => Err(GtError::from(e))
@@ -73,11 +76,16 @@ async fn main() -> Result<(), GtError> {
     // the program arrives here if either a signal is received, 
     // or there was some issue during initialization
     info!("Cleaning up and exiting...");
-    vtrackpad.mouse_up()?;      // just in case
-    vtrackpad.destruct()?;      // we don't need virtual devices cluttering the system
     
-    info!("Clean up successful.");
-    main_result
+    // Cleanup: access vtrackpad through translator if available
+    if let Ok(mut translator) = main_result {
+        translator.vtp.mouse_up()?;      // just in case
+        translator.vtp.destruct()?;      // we don't need virtual devices cluttering the system
+        info!("Clean up successful.");
+        Ok(())
+    } else {
+        main_result.map(|_| ())
+    }
 }
 
 
@@ -88,10 +96,8 @@ async fn run_main_event_loop(
     mut translator: GestureTranslator,
     recvr: Receiver<ControlSignal>,
     should_exit: &Arc<AtomicBool>,
-    mut real_trackpad: input::Libinput, 
-    mut cfg_last_modified: SystemTime
-    
-) -> Result<(), GtError> {
+    real_trackpad: input::Libinput
+) -> Result<GestureTranslator, GtError> {
 
     // spawn 1 separate thread to handle mouse_up_delay timeouts
     debug!("Creating new thread to manage drag end timer");
@@ -105,74 +111,64 @@ async fn run_main_event_loop(
     };
 
     let mouse_up_listener = tokio::spawn(fork_fn);
-    let cfg_file_path = config::get_config_file_path()?; 
 
     info!("linux-3-finger-drag started successfully!");
 
+    // Wrap the libinput file descriptor for async event-driven polling
+    let fd_raw = real_trackpad.as_raw_fd();
+    let async_fd = AsyncFd::new(fd_raw)
+        .expect("Failed to create AsyncFd for libinput file descriptor");
+    
+    // We need to move real_trackpad into a position where we can use it with the async_fd
+    // Since AsyncFd only wraps the FD, we keep real_trackpad separate
+    let mut real_trackpad = real_trackpad;
+
     loop {
-        // this is to keep the infinite loop from filling out into
-        // entire CPU core, which it will do even on no-ops.
-        std::thread::sleep(translator.cfg.response_time);
+        tokio::select! {
+            biased;
+            
+            // Wait for libinput events (touchpad activity)
+            Ok(mut guard) = async_fd.readable() => {
+                // Clear the ready state
+                guard.clear_ready();
+                
+                // Process all available events
+                if let Err(e) = real_trackpad.dispatch() {
+                    error!("A {} error occured in reading device buffer: {}", e.kind(), e);
+                }
 
-        // check if the configuration was modified, and if so, update configs in memory
-        let cfg_last_modified_update = std::fs::metadata(&cfg_file_path)?.modified()?;
+                for event in &mut real_trackpad {
+                    trace!("Event received from libinput");
 
-        if cfg_last_modified_update > cfg_last_modified {
-
-            let new_cfg = config::init_cfg();
-            translator.cfg = new_cfg.clone();
-
-            cfg_last_modified = cfg_last_modified_update;
-        }
-        
-        // check if the configuration was modified, and if so, update configs in memory
-        let cfg_last_modified_update = std::fs::metadata(&cfg_file_path)?.modified()?;
-
-        if cfg_last_modified_update > cfg_last_modified {
-
-            let new_cfg = config::init_cfg();
-            translator.cfg = new_cfg.clone();
-
-            cfg_last_modified = cfg_last_modified_update;
-        }
-
-
-        // handle interrupts
-        if should_exit.load(Ordering::Relaxed) {
-            break;
-        }
-        
-        if let Err(e) = real_trackpad.dispatch() {
-            error!("A {} error occured in reading device buffer: {}", e.kind(), e);
-        }
-
-        for event in &mut real_trackpad {
-
-            trace!("Blocking in main()'s for loop");
-
-            // do nothing on success (or ignored gesture)
-            if let Err(e) = translator.translate_gesture(event).await { 
-                error!("{:?}", e); 
+                    // Process the gesture
+                    if let Err(e) = translator.translate_gesture(event).await { 
+                        error!("{:?}", e); 
+                    }
+                }
+                
+                // Check if mouse_up_listener crashed (once per batch)
+                if mouse_up_listener.is_finished() {
+                    let fork_err = mouse_up_listener.await?.unwrap_err();
+                    error!("Error raised in fork: {:?}", fork_err);
+                    return Err(fork_err);
+                }
             }
-
-            // Without being a `ControlSignal::TerminateThread` being sent
-            // into the channel, the other thread only finishes when
-            // is an error is raised. it has been designed not to panic. 
-            // the value the thread returns is a `Result`, so the this extracts 
-            // the Result from the fork and returns it.
-            if mouse_up_listener.is_finished() {
-                let fork_err = mouse_up_listener.await?.unwrap_err();
-                error!("Error raised in fork: {:?}", fork_err);
-                return Err(fork_err);
+            
+            // Periodically check for exit signal
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                if should_exit.load(Ordering::Acquire) {
+                    break;
+                }
             }
         }
-    };
+    }
 
     debug!("Joining delay timer thread");
     translator.send_signal(ControlSignal::TerminateThread).await?;
 
-    // awaiting a JoinHandle produces a Result
-    // the generic for this JoinHandle, though, is itself a Result, 
-    // so we can just return what the JoinHandle yields
-    mouse_up_listener.await? 
+    // Wait for the mouse_up_listener to finish
+    mouse_up_listener.await??;
+    
+    // Return translator for cleanup
+    Ok(translator)
 }

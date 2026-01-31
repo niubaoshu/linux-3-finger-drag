@@ -9,8 +9,7 @@ use std::{
     os::{fd::AsFd, unix::fs::OpenOptionsExt}, 
     thread, time::{self, Duration}
 };
-use futures_lite::future::FutureExt;
-use async_io::Timer;
+
 use tokio::sync::mpsc::Receiver;
 use input_linux::{
     EventKind, EventTime, 
@@ -59,18 +58,19 @@ pub fn start_handler() -> Result<VirtualTrackpad, std::io::Error> {
 
     let uhandle = UInputHandle::new(uinput_file);
 
-    // I'm using unwraps here because this function is only called 
-    // during the program's setup phase. I've also never had these 
-    // functions below crash the program; if this `start_handler()`
-    // ever crashes (from my experience), it's always an issue with
-    // trying to read `/dev/uinput`. It's typically smooth sailing
-    // in this function after that succeeds. 
-    uhandle.set_evbit(EventKind::Key).unwrap();
-    uhandle.set_keybit(input_linux::Key::ButtonLeft).unwrap();
+    // Setting up virtual device capabilities during initialization.
+    // These operations should not fail if /dev/uinput was successfully opened.
+    uhandle.set_evbit(EventKind::Key)
+        .expect("Failed to set Key event capability on virtual device");
+    uhandle.set_keybit(input_linux::Key::ButtonLeft)
+        .expect("Failed to set ButtonLeft capability on virtual device");
 
-    uhandle.set_evbit(EventKind::Relative).unwrap();
-    uhandle.set_relbit(RelativeAxis::X).unwrap();
-    uhandle.set_relbit(RelativeAxis::Y).unwrap();
+    uhandle.set_evbit(EventKind::Relative)
+        .expect("Failed to set Relative event capability on virtual device");
+    uhandle.set_relbit(RelativeAxis::X)
+        .expect("Failed to set X-axis capability on virtual device");
+    uhandle.set_relbit(RelativeAxis::Y)
+        .expect("Failed to set Y-axis capability on virtual device");
 
     let input_id = InputId {
         bustype: input_linux::sys::BUS_USB,
@@ -79,7 +79,8 @@ pub fn start_handler() -> Result<VirtualTrackpad, std::io::Error> {
         version: 0,
     };
     let device_name = b"Virtual trackpad (created by linux-3-finger-drag)";
-    uhandle.create(&input_id, device_name, 0, &[]).unwrap();
+    uhandle.create(&input_id, device_name, 0, &[])
+        .expect("Failed to create virtual trackpad device");
     debug!("Virtual trackpad successfully created.");
 
     // may be needed to let the system catch up
@@ -94,32 +95,6 @@ pub fn start_handler() -> Result<VirtualTrackpad, std::io::Error> {
 
 }
 
-
-/// Start a timer for `delay`.
-/// 
-/// The messy return type is to match `listen_for_signal`. It is infallible.
-async fn plain_timeout(delay: Duration) -> Option<ControlSignal>{
-    trace!("Starting delay of {:?}", delay);
-    Timer::after(delay).await;
-    trace!("Delay completed fully");
-    None
-}
-
-// dragEndDelay time should be cut short by a pointer or scoll gesture;
-// this function listens on the channel for either a pointer button press,
-// a scoll event, or a non-3-finger gesture, and exits when it gets one
-async fn listen_for_signal(rx: &mut Receiver<ControlSignal>) -> Option<ControlSignal> {
-
-    // function blocks until signal is received
-    // since ControlSignal is the only thing
-    // ever sent in the channel, there's no need to
-    // check that that's what we received
-    debug!("Listening for cancel signal...");
-    trace!("Size of buffer currently: {}", rx.len());
-    let sig = rx.recv().await?;
-    debug!("Signal received: {:?}", sig);
-    Some(sig)
-}
 
 impl Clone for VirtualTrackpad {
     /// This clone() can theoretically panic since there is an expect() in 
@@ -232,15 +207,12 @@ impl VirtualTrackpad
 
             // handle signals received during timer loop
             // that can't be handled within that scope
-            match self.run_timer(delay, &mut rx).await {
-                Some(signal) => {
-                    match signal {
-                        CancelMouseUp => continue,
-                        TerminateThread => break,
-                        _ => {}                     // cancel/restart timer have already been handled
-                    }
-                },
-                None => {}
+            if let Some(signal) = self.run_timer(delay, &mut rx).await {
+                match signal {
+                    CancelMouseUp => continue,
+                    TerminateThread => break,
+                    _ => {}                     // cancel/restart timer have already been handled
+                }
             }
 
             self.mouse_up()?;
@@ -335,10 +307,14 @@ impl VirtualTrackpad
     /// within the function.
     async fn run_timer(&self, delay: Duration, rx: &mut Receiver<ControlSignal>) -> Option<ControlSignal> {
         loop {
-            // catches the output of the function that returns first
-            let signal = plain_timeout(delay)
-                .or(listen_for_signal(rx))
-                .await?;
+            // Use tokio::select! to race between timeout and signal
+            let signal = tokio::select! {
+                _ = tokio::time::sleep(delay) => {
+                    trace!("Delay completed fully");
+                    None
+                }
+                sig = rx.recv() => sig
+            }?;
             
             match signal {
                 RestartTimer => continue,  

@@ -14,9 +14,7 @@ users = "0.11.0"
 serde_with = "3.14.0"
 tracing-subscriber = { version = "0.3.19", features = ["chrono"] }
 tracing = "0.1.41"
-tokio = { version = "1.47.1", features = ["macros", "rt", "rt-multi-thread", "sync"] }
-futures-lite = "2.6.1"
-async-io = "2.5.0"
+tokio = { version = "1.47.1", features = ["macros", "rt", "rt-multi-thread", "sync", "time", "net"] }
 
 [dev-dependencies]
 criterion = "0.7.0"
